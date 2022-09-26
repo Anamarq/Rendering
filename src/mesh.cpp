@@ -1,0 +1,221 @@
+/*
+    This file is part of Nori, a simple educational ray tracer
+
+    Copyright (c) 2015 by Wenzel Jakob
+
+    Nori is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License Version 3
+    as published by the Free Software Foundation.
+
+    Nori is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program. If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include <nori/mesh.h>
+#include <nori/bbox.h>
+#include <nori/bsdf.h>
+#include <nori/emitter.h>
+#include <nori/warp.h>
+#include <Eigen/Geometry>
+
+NORI_NAMESPACE_BEGIN
+
+Mesh::Mesh() { }
+
+Mesh::~Mesh() {
+    delete m_bsdf;
+    delete m_emitter;
+}
+
+void Mesh::activate() {
+    if (!m_bsdf) {
+        /* If no material was assigned, instantiate a diffuse BRDF */
+        m_bsdf = static_cast<BSDF *>(
+            NoriObjectFactory::createInstance("diffuse", PropertyList()));
+    }
+    //Inicializar estructura DisscretePDF
+    m_dpdf.clear();
+    m_dpdf.reserve(getTriangleCount()); //Numero de triangulos
+    for (int i = 0; i < getTriangleCount(); ++i) {
+        m_dpdf.append(surfaceArea(i)); //Peso de la muestra i. 
+        m_area += surfaceArea(i);
+    }
+    m_dpdf.normalize(); //Normalizar
+}
+void Mesh::samplePoint(EmitterQueryRecord& lRec, const Point2f& sample) const {
+    //Función de muestreo
+    //1. Seleccionar el triángulo, con probabilidad proporcional al área.
+    //Esto requiere la utilización del método de inversión para funciones de probabilidad discretas
+    //renormalizar el número aleatorio para evitar  sesgo en muestreos posteriores
+
+
+    //NOrmalizar sample
+    float f = (float)sample.x();
+    int id= m_dpdf.sampleReuse(f); //The discrete index associated with the sample
+
+    //2. muestrear dentro del triángulo, reutilizando para un triángulo arbitrario la funcionalidad que se programó en
+    //Warp::squareToTent().A la vez que se muestrea el punto de la malla, es conveniente
+    // obtener también la normal.
+    Point2f p = Warp::squareToTent(sample);
+    //sacar w es el p1, u y v 
+    float w = p.y();
+    float u = (-w + 1 - p.x()) / 2;
+    float v = p.x() + u;
+    Point3f bar = (u, v, w);
+    uint32_t i0 = m_F(0, id), i1 = m_F(1, id), i2 = m_F(2, id); ///indice vertices triangulos
+    const Point3f p0 = m_V.col(i0), p1 = m_V.col(i1), p2 = m_V.col(i2); //vertices accediendo
+    
+    lRec.p = u * p0 + v * p1 + w * p2;
+    Vector3f vi = (p1 - p0);
+    Vector3f vo = (p2 - p0);
+
+
+    //Comprobar qur m_n tenga algo
+    //en ese caso hay que meterse en la matriz y coger los valores de la normal
+    Normal3f n;
+    if (m_N.size() > 0) {
+        const Point3f n0 = m_N.col(i0), n1 = m_N.col(i1), n2 = m_N.col(i2); //vertices accediendo
+        n= (n0 * u, n1 * v, n2 * w).normalized();
+    }
+    else {
+        n = vi.cross(vo).normalized();
+    }  
+    lRec.n = n;
+    //evaluar la probabilidad de la muestra desde el punto de vista del emisor (con probabilidad
+     //uniforme basada en el área)
+    lRec.pdf = m_dpdf.getNormalization();
+}
+
+
+
+
+float Mesh::surfaceArea(uint32_t index) const {
+    uint32_t i0 = m_F(0, index), i1 = m_F(1, index), i2 = m_F(2, index);
+
+    const Point3f p0 = m_V.col(i0), p1 = m_V.col(i1), p2 = m_V.col(i2);
+
+    return 0.5f * Vector3f((p1 - p0).cross(p2 - p0)).norm();
+}
+
+bool Mesh::rayIntersect(uint32_t index, const Ray3f &ray, float &u, float &v, float &t) const {
+    uint32_t i0 = m_F(0, index), i1 = m_F(1, index), i2 = m_F(2, index); ///indice vertices triangulos
+    const Point3f p0 = m_V.col(i0), p1 = m_V.col(i1), p2 = m_V.col(i2); //vertices accediendo
+
+    /* Find vectors for two edges sharing v[0] */
+    Vector3f edge1 = p1 - p0, edge2 = p2 - p0;
+
+    /* Begin calculating determinant - also used to calculate U parameter */
+    Vector3f pvec = ray.d.cross(edge2);
+
+    /* If determinant is near zero, ray lies in plane of triangle */
+    float det = edge1.dot(pvec);
+
+    if (det > -1e-8f && det < 1e-8f)
+        return false;
+    float inv_det = 1.0f / det;
+
+    /* Calculate distance from v[0] to ray origin */
+    Vector3f tvec = ray.o - p0;
+
+    /* Calculate U parameter and test bounds */
+    u = tvec.dot(pvec) * inv_det;
+    if (u < 0.0 || u > 1.0)
+        return false;
+
+    /* Prepare to test V parameter */
+    Vector3f qvec = tvec.cross(edge1);
+
+    /* Calculate V parameter and test bounds */
+    v = ray.d.dot(qvec) * inv_det;
+    if (v < 0.0 || u + v > 1.0)
+        return false;
+
+    /* Ray intersects triangle -> compute t */
+    t = edge2.dot(qvec) * inv_det;
+
+    return t >= ray.mint && t <= ray.maxt;
+}
+
+BoundingBox3f Mesh::getBoundingBox(uint32_t index) const {
+    BoundingBox3f result(m_V.col(m_F(0, index)));
+    result.expandBy(m_V.col(m_F(1, index)));
+    result.expandBy(m_V.col(m_F(2, index)));
+    return result;
+}
+
+Point3f Mesh::getCentroid(uint32_t index) const {
+    return (1.0f / 3.0f) *
+        (m_V.col(m_F(0, index)) +
+         m_V.col(m_F(1, index)) +
+         m_V.col(m_F(2, index)));
+}
+
+void Mesh::addChild(NoriObject *obj) {
+    switch (obj->getClassType()) {
+        case EBSDF:
+            if (m_bsdf)
+                throw NoriException(
+                    "Mesh: tried to register multiple BSDF instances!");
+            m_bsdf = static_cast<BSDF *>(obj);
+            break;
+
+        case EEmitter: {
+                Emitter *emitter = static_cast<Emitter *>(obj);
+                if (m_emitter)
+                    throw NoriException(
+                        "Mesh: tried to register multiple Emitter instances!");
+                m_emitter = emitter;
+            }
+            break;
+
+        default:
+            throw NoriException("Mesh::addChild(<%s>) is not supported!",
+                                classTypeName(obj->getClassType()));
+    }
+}
+
+std::string Mesh::toString() const {
+    return tfm::format(
+        "Mesh[\n"
+        "  name = \"%s\",\n"
+        "  vertexCount = %i,\n"
+        "  triangleCount = %i,\n"
+        "  bsdf = %s,\n"
+        "  emitter = %s\n"
+        "]",
+        m_name,
+        m_V.cols(),
+        m_F.cols(),
+        m_bsdf ? indent(m_bsdf->toString()) : std::string("null"),
+        m_emitter ? indent(m_emitter->toString()) : std::string("null")
+    );
+}
+
+std::string Intersection::toString() const {
+    if (!mesh)
+        return "Intersection[invalid]";
+
+    return tfm::format(
+        "Intersection[\n"
+        "  p = %s,\n"
+        "  t = %f,\n"
+        "  uv = %s,\n"
+        "  shFrame = %s,\n"
+        "  geoFrame = %s,\n"
+        "  mesh = %s\n"
+        "]",
+        p.toString(),
+        t,
+        uv.toString(),
+        indent(shFrame.toString()),
+        indent(geoFrame.toString()),
+        mesh ? mesh->toString() : std::string("null")
+    );
+}
+
+NORI_NAMESPACE_END
